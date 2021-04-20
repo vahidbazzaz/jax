@@ -85,6 +85,7 @@ sin_p = Primitive("sin")
 cos_p = Primitive("cos")
 reduce_sum_p = Primitive("reduce_sum")
 greater_p = Primitive("greater")
+less_p = Primitive("less")
 transpose_p = Primitive("transpose")
 broadcast_p = Primitive("broadcast")
 
@@ -95,6 +96,7 @@ def sin(x): return bind1(sin_p, x)
 def cos(x): return bind1(cos_p, x)
 def reduce_sum(x, axis=None): return bind1(reduce_sum_p, x, axis=axis)
 def greater(x, y): return bind1(greater_p, x, y)
+def less(x, y): return bind1(less_p, x, y)
 def transpose(x, perm): return bind1(transpose_p, perm=perm)
 def broadcast(x, shape, axes): return bind1(broadcast_p, x, shape=shape, axes=axes)
 
@@ -128,7 +130,7 @@ def bind1(prim, *args, **params):
 
 # +
 from contextlib import contextmanager
-from typing import Type, List, Optional, Any
+from typing import Type, List, Tuple, Sequence, Optional, Any
 
 class MainTrace(NamedTuple):
   level: int
@@ -197,7 +199,6 @@ class Trace:
 
 # +
 import numpy as np
-from typing import Tuple
 
 class Tracer:
   _trace: Trace
@@ -217,6 +218,7 @@ class Tracer:
   def __mul__(self, other): return self.aval._mul(self, other)
   def __rmul__(self, other): return self.aval._rmul(self, other)
   def __gt__(self, other): return self.aval._gt(self, other)
+  def __lt__(self, other): return self.aval._lt(self, other)
   def __bool__(self): return self.aval._bool(self)
   def __nonzero__(self): return self.aval._nonzero(self)
 
@@ -248,6 +250,7 @@ class ShapedArray:
   _mul = staticmethod(mul)
   _rmul = staticmethod(swap(mul))
   _gt = staticmethod(greater)
+  _lt = staticmethod(less)
 
   @staticmethod
   def _bool(tracer):
@@ -404,6 +407,7 @@ impl_rules[sin_p] = lambda x: [np.sin(x)]
 impl_rules[cos_p] = lambda x: [np.cos(x)]
 impl_rules[reduce_sum_p] = lambda x, *, axis: [np.sum(x, axis)]
 impl_rules[greater_p] = lambda x, y: [np.greater(x, y)]
+impl_rules[less_p] = lambda x, y: [np.less(x, y)]
 impl_rules[transpose_p] = lambda x, *, perm: [np.transpose(x, perm)]
 
 def broadcast_impl(x, *, shape, axes):
@@ -433,7 +437,8 @@ print(f(3.0))
 
 # +
 def zeros_like(val):
-  return np.zeros_like(val)
+  aval = get_aval(val)
+  return np.zeros(aval.shape, aval.dtype)
 
 def unzip2(pairs):
   lst1, lst2 = [], []
@@ -522,6 +527,12 @@ def greater_jvp(primals, tangents):
   out_primal = greater(x, y)
   return [out_primal], [zeros_like(out_primal)]
 jvp_rules[greater_p] = greater_jvp
+
+def less_jvp(primals, tangents):
+  (x, y), _ = primals, tangents
+  out_primal = less(x, y)
+  return [out_primal], [zeros_like(out_primal)]
+jvp_rules[less_p] = less_jvp
 # -
 
 # Finally, we add a transformation API to kick off the trace:
@@ -951,8 +962,8 @@ class Lit:
   aval: ShapedArray
 
   def __init__(self, val):
-    self.val = val
-    self.aval = raise_to_shaped(get_aval(self.val))
+    self.aval = aval = raise_to_shaped(get_aval(val))
+    self.val = np.array(val, aval.dtype)
 
 Atom = Union[Var, Lit]
 
@@ -1055,6 +1066,18 @@ def jaxpr_as_fun(jaxpr: Jaxpr):
 # `lax.while_loop`, and `lax.scan`.
 
 # +
+def split_list(lst: List[Any], n: int) -> Tuple[List[Any], List[Any]]:
+  assert 0 <= n <= len(lst)
+  return lst[:n], lst[n:]
+
+def partition_list(bs: List[bool], l: List[Any]) -> Tuple[List[Any], List[Any]]:
+  assert len(bs) == len(l)
+  lists = lst1, lst2 = [], []
+  for b, x in zip(bs, l):
+    lists[b].append(x)
+  return lst1, lst2
+
+# +
 # NB: the analogous class in JAX is called 'DynamicJaxprTracer'
 class JaxprTracer(Tracer):
   __slots__ = ['aval']
@@ -1146,7 +1169,21 @@ class JaxprBuilder:
     out_vars = [t2v(t) for t in out_tracers]
     jaxpr = Jaxpr(in_binders, self.eqns, out_vars)
     typecheck_jaxpr(jaxpr)
+    jaxpr, constvals = _inline_literals(jaxpr, constvals)
     return jaxpr, constvals
+
+def _inline_literals(jaxpr: Jaxpr, consts: List[Any]) -> Tuple[Jaxpr, List[Any]]:
+  const_binders, other_binders = split_list(jaxpr.in_binders, len(consts))
+  scalars = [type(x) in jax_types and not get_aval(x).shape for x in consts]
+  new_const_binders, lit_binders = partition_list(scalars, const_binders)
+  new_consts, lit_vals = partition_list(scalars, consts)
+  literals = dict(zip(lit_binders, map(Lit, lit_vals)))
+  new_eqns = [JaxprEqn(eqn.primitive, [literals.get(x, x) for x in eqn.inputs],
+                       eqn.params, eqn.out_binders) for eqn in jaxpr.eqns]
+  new_outs = [literals.get(x, x) for x in jaxpr.outs]
+  new_jaxpr = Jaxpr(new_const_binders + other_binders, new_eqns, new_outs)
+  typecheck_jaxpr(new_jaxpr)
+  return new_jaxpr, new_consts
 
 # The rules we need for `JaxprTrace.process_primitive` are essentially typing
 # rules for primitive applications: given the primitive, its parameters, and
@@ -1160,36 +1197,38 @@ class JaxprBuilder:
 # generality is useful.
 
 # +
-def broadcast_shapes(*shapes):
-  assert len(shapes) > 1
-  for sizes in zip(*shapes):
-    sizes = [d for d in sizes if d != 1]
-    if sizes[:-1] != sizes[1:]:
-      raise Exception
-  return tuple(next((d for d in sizes if d != 1), 1) for sizes in zip(*shapes))
+def binop_abstract_eval(x: ShapedArray, y: ShapedArray) -> List[ShapedArray]:
+  if not isinstance(x, ShapedArray) or not isinstance(y, ShapedArray):
+    raise TypeError
+  if raise_to_shaped(x) != raise_to_shaped(y): raise TypeError
+  return [ShapedArray(x.shape, x.dtype)]
 
-def broadcasting_binop_abstract_eval_rule(*avals_in):
-  out_dtype = np.result_type(*map(np.result_type, avals_in))
-  out_shape = broadcast_shapes(*map(np.shape, avals_in))
-  return [ShapedArray(out_shape, out_dtype)]
+abstract_eval_rules[add_p] = binop_abstract_eval
+abstract_eval_rules[mul_p] = binop_abstract_eval
 
-abstract_eval_rules[add_p] = broadcasting_binop_abstract_eval_rule
-abstract_eval_rules[mul_p] = broadcasting_binop_abstract_eval_rule
+def compare_abstract_eval(x: ShapedArray, y: ShapedArray) -> List[ShapedArray]:
+  if not isinstance(x, ShapedArray) or not isinstance(y, ShapedArray):
+    raise TypeError
+  if x.shape != y.shape: raise TypeError
+  return [ShapedArray(x.shape, np.dtype('bool'))]
+abstract_eval_rules[greater_p] = compare_abstract_eval
+abstract_eval_rules[less_p] = compare_abstract_eval
 
-def vectorized_unop_abstract_eval_rule(aval_in):
-  return [ShapedArray(np.shape(aval_in), np.result_type(aval_in))]
+def vectorized_unop_abstract_eval(x: ShapedArray) -> List[ShapedArray]:
+  return [ShapedArray(x.shape, x.dtype)]
 
-abstract_eval_rules[sin_p] = vectorized_unop_abstract_eval_rule
-abstract_eval_rules[cos_p] = vectorized_unop_abstract_eval_rule
-abstract_eval_rules[neg_p] = vectorized_unop_abstract_eval_rule
+abstract_eval_rules[sin_p] = vectorized_unop_abstract_eval
+abstract_eval_rules[cos_p] = vectorized_unop_abstract_eval
+abstract_eval_rules[neg_p] = vectorized_unop_abstract_eval
 
-def reduce_sum_abstract_eval_rule(aval_in, *, axis):
-  new_shape = [d for i, d in enumerate(aval_in.shape) if i != axis]
-  return [ShapedArray(tuple(new_shape), aval_in.dtype)]
-abstract_eval_rules[reduce_sum_p] = reduce_sum_abstract_eval_rule
+def reduce_sum_abstract_eval(x: ShapedArray, *, axis: int) -> List[ShapedArray]:
+  new_shape = [d for i, d in enumerate(x.shape) if i != axis]
+  return [ShapedArray(tuple(new_shape), x.dtype)]
+abstract_eval_rules[reduce_sum_p] = reduce_sum_abstract_eval
 
-def broadcast_abstract_eval(x, *, shape, axes):
-  return [ShapedArray(tuple(shape), np.result_type(x))]
+def broadcast_abstract_eval(x: ShapedArray, *, shape: Sequence[int],
+                            axes: Sequence[int]) -> List[ShapedArray]:
+  return [ShapedArray(tuple(shape), x.dtype)]
 abstract_eval_rules[broadcast_p] = broadcast_abstract_eval
 # -
 
@@ -1529,6 +1568,7 @@ xla_translations[neg_p] = partial(direct_translation, xops.Neg)
 xla_translations[sin_p] = partial(direct_translation, xops.Sin)
 xla_translations[cos_p] = partial(direct_translation, xops.Cos)
 xla_translations[greater_p] = partial(direct_translation, xops.Gt)
+xla_translations[less_p] = partial(direct_translation, xops.Lt)
 
 def reduce_sum_translation(c, in_avals, in_vals, *, axis):
   (x_aval,), (x,) = in_avals, in_vals
@@ -1717,6 +1757,7 @@ class DeviceArray:
   _mul = staticmethod(mul)
   _rmul = staticmethod(mul)
   _gt = staticmethod(greater)
+  _lt = staticmethod(less)
 input_handlers[DeviceArray] = lambda x: x.buf
 
 jax_types.add(DeviceArray)
@@ -1783,19 +1824,9 @@ print(ydot)
 # First, some utilities:
 
 # +
-def split_list(lst: List[Any], n: int) -> Tuple[List[Any], List[Any]]:
-  return lst[:n], lst[n:]
-
 def split_half(lst: List[Any]) -> Tuple[List[Any], List[Any]]:
   assert not len(lst) % 2
   return split_list(lst, len(lst) // 2)
-
-def partition_list(bs: List[bool], l: List[Any]) -> Tuple[List[Any], List[Any]]:
-  assert len(bs) == len(l)
-  lists = lst1, lst2 = [], []
-  for b, x in zip(bs, l):
-    lists[b].append(x)
-  return lst1, lst2
 
 def merge_lists(which: List[bool], l1: List[Any], l2: List[Any]) -> List[Any]:
   l1, l2 = iter(l1), iter(l2)
@@ -2184,8 +2215,7 @@ def partial_eval_jaxpr(jaxpr: Jaxpr, in_unknowns: List[bool],
   residuals = set()
 
   def read(v: Atom) -> bool:
-    if type(v) is Lit: raise NotImplementedError
-    return env[v]
+    return type(v) is Var and env[v]
 
   def write(unk: bool, v: Var) -> None:
     env[v] = unk
@@ -2568,9 +2598,9 @@ def cond_jvp_rule(primals, tangents, *, true_jaxpr, false_jaxpr):
   true_jaxpr, false_jaxpr = _join_jaxpr_consts(
       true_jaxpr, false_jaxpr, len(true_consts), len(false_consts))
   assert typecheck_jaxpr(true_jaxpr) == typecheck_jaxpr(false_jaxpr)
-  outs = bind(cond_p, pred, *true_consts, *false_consts, *primals, *tangents,
-              true_jaxpr=true_jaxpr, false_jaxpr=false_jaxpr)
-  primals_out, tangents_out = split_list(outs, len(outs) // 2)
+  outs = bind_cond(pred, *true_consts, *false_consts, *primals, *tangents,
+                   true_jaxpr=true_jaxpr, false_jaxpr=false_jaxpr)
+  primals_out, tangents_out = split_half(outs)
   return primals_out, tangents_out
 jvp_rules[cond_p] = cond_jvp_rule
 
@@ -2587,13 +2617,13 @@ def cond_vmap_rule(axis_size, vals_in, dims_in, *, true_jaxpr, false_jaxpr):
   true_jaxpr, false_jaxpr = _join_jaxpr_consts(
       true_jaxpr, false_jaxpr, len(true_consts), len(false_consts))
   assert typecheck_jaxpr(true_jaxpr) == typecheck_jaxpr(false_jaxpr)
-  outs = bind(cond_p, pred, *true_consts, *false_consts, *vals_in,
-              true_jaxpr=true_jaxpr, false_jaxpr=false_jaxpr)
+  outs = bind_cond(pred, *true_consts, *false_consts, *vals_in,
+                   true_jaxpr=true_jaxpr, false_jaxpr=false_jaxpr)
   return outs, [0] * len(outs)
 vmap_rules[cond_p] = cond_vmap_rule
 
 xs = np.array([1., 2., 3])
-out = vmap(lambda x: cond(True, lambda: x + 1, lambda: 0.), (0,))(xs)
+out = vmap(lambda x: cond(True, lambda: x + 1., lambda: 0.), (0,))(xs)
 print(out)
 
 
@@ -2645,8 +2675,8 @@ def cond_partial_eval(trace, tracers, *, true_jaxpr, false_jaxpr):
 
   known_tracers, unknown_tracers = partition_list(in_uks, tracers)
   known_vals = [t.pval.const for t in known_tracers]
-  outs1_res = bind(cond_p, pred, *known_vals,
-                   true_jaxpr=t_jaxpr1, false_jaxpr=f_jaxpr1)
+  outs1_res = bind_cond(pred, *known_vals,
+                        true_jaxpr=t_jaxpr1, false_jaxpr=f_jaxpr1)
   outs1, res = split_list(outs1_res, len(outs1_res) - num_res)
   pred_tracer_ = trace.instantiate_const(full_raise(trace, pred_tracer))
   res_tracers = [trace.instantiate_const(full_raise(trace, x)) for x in res]
@@ -2704,7 +2734,7 @@ def cond_peval_eqn(unks_in: List[bool], eqn: JaxprEqn,
   t_jaxpr1, f_jaxpr1, t_jaxpr2, f_jaxpr2 = jaxprs
   ins1, ins2 = partition_list(unks_in, eqn.inputs[1:])
   outs1, outs2 = partition_list(unks_out, eqn.out_binders)
-  residuals, _ = split_list(t_jaxpr2.in_binders, num_res)  # TODO check this?
+  residuals, _ = split_list(t_jaxpr2.in_binders, num_res)
   eqn1 = JaxprEqn(cond_p, [eqn.inputs[0], *ins1],
                   dict(true_jaxpr=t_jaxpr1, false_jaxpr=f_jaxpr1),
                   outs1 + residuals)
@@ -2726,11 +2756,96 @@ def cond_transpose_rule(cts, pred, *invals, true_jaxpr, false_jaxpr):
   true_jaxpr, false_jaxpr = _join_jaxpr_consts(
       true_jaxpr, false_jaxpr, len(true_consts), len(false_consts))
   res = [x for x in invals if type(x) is not UndefPrimal]
-  outs = bind(cond_p, pred, *true_consts, *false_consts, *res, *cts,
-              true_jaxpr=true_jaxpr, false_jaxpr=false_jaxpr)
+  outs = bind_cond(pred, *true_consts, *false_consts, *res, *cts,
+                   true_jaxpr=true_jaxpr, false_jaxpr=false_jaxpr)
   outs = iter(outs)
   return [None] + [next(outs) if type(x) is UndefPrimal else None for x in invals]
 transpose_rules[cond_p] = cond_transpose_rule
 
 out = grad(lambda x: cond(True, lambda: x * x, lambda: 0.))(1.)
 print(out)
+
+
+def while_loop(cond_fn, body_fn, init_val):
+  init_val, in_tree = tree_flatten(init_val)
+  avals_in = [raise_to_shaped(get_aval(x)) for x in init_val]
+  cond_jaxpr, cond_consts, cond_tree = make_jaxpr(cond_fn, *avals_in)
+  body_jaxpr, body_consts, in_tree_ = make_jaxpr(body_fn, *avals_in)
+  cond_jaxpr, body_jaxpr = _join_jaxpr_consts(
+      cond_jaxpr, body_jaxpr, len(cond_consts), len(body_consts))
+  if cond_tree != tree_flatten(True)[1]: raise TypeError
+  if in_tree != in_tree_: raise TypeError
+  outs = bind(while_loop_p, *cond_consts, *body_consts, *init_val,
+              cond_jaxpr=cond_jaxpr, body_jaxpr=body_jaxpr)
+  return tree_unflatten(in_tree, outs)
+while_loop_p = Primitive('while_loop')
+
+# Notice the convention that args = [*consts, *carry].
+
+def while_loop_impl(*args, cond_jaxpr, body_jaxpr):
+  consts, carry = split_list(args, _loop_num_consts(body_jaxpr))
+  while eval_jaxpr(cond_jaxpr, [*consts, *carry])[0]:
+    carry = eval_jaxpr(body_jaxpr, [*consts, *carry])
+  return carry
+impl_rules[while_loop_p] = while_loop_impl
+
+def _loop_num_consts(body_jaxpr: Jaxpr) -> int:
+  return len(body_jaxpr.in_binders) - len(body_jaxpr.outs)
+
+out = while_loop(lambda x: x > 0, lambda x: x + -3, 10)
+print(out)
+
+
+# For jvps we have the convention that args = [*primals, *tangents]. But now
+# that's in conflict with our while_loop convention that args = [*consts,
+# *carry].
+
+
+def while_loop_jvp_rule(primals, tangents, *, cond_jaxpr, body_jaxpr):
+  num_consts = _loop_num_consts(body_jaxpr)
+  body_jaxpr, body_consts = jvp_jaxpr(body_jaxpr)
+  cond_jaxpr, body_jaxpr = _loop_jvp_binders(
+      cond_jaxpr, body_jaxpr, len(body_consts), num_consts)
+  outs = bind(while_loop_p, *body_consts, *primals, *tangents,
+              cond_jaxpr=cond_jaxpr, body_jaxpr=body_jaxpr)
+  primals_out, tangents_out = split_half(outs)
+  return primals_out, tangents_out
+jvp_rules[while_loop_p] = while_loop_jvp_rule
+
+def _loop_jvp_binders(cond_jaxpr: Jaxpr, body_jaxpr: Jaxpr, n1: int, n2: int
+                      ) -> Jaxpr:
+  # body binders [c1, c2, x1, c2dot, x2dot] -> [c1, c2, c2dot, x1, x1dot]
+  jvp_const_binders, binders = split_list(body_jaxpr.in_binders, n1)
+  primal_binders, tangent_binders = split_half(binders)
+  consts    , carry     = split_list(primal_binders , n2)
+  consts_dot, carry_dot = split_list(tangent_binders, n2)
+  new_in_binders = jvp_const_binders + consts + consts_dot + carry + carry_dot
+  new_body_jaxpr = Jaxpr(new_in_binders, body_jaxpr.eqns, body_jaxpr.outs)
+  typecheck_jaxpr(new_body_jaxpr)
+
+  # cond binders [c2, x1] -> [c1, c2, c2dot, x1, x1dot]
+  assert not set(new_body_jaxpr.in_binders) & set(cond_jaxpr.in_binders)
+  consts, carry = split_list(cond_jaxpr.in_binders, n2)
+  new_in_binders = jvp_const_binders + consts + consts_dot + carry + carry_dot
+  new_cond_jaxpr = Jaxpr(new_in_binders, cond_jaxpr.eqns, cond_jaxpr.outs)
+
+  return new_cond_jaxpr, new_body_jaxpr
+
+out, out_tan = jvp(lambda x: while_loop(lambda x: x < 10., lambda x: x * 2., x),
+                   (1.,), (1.,))
+print(out_tan)
+
+
+def f(x):
+  def cond_fn(i, _):
+    return i < 3
+  def body_fn(i, x):
+    return i + 1, cos(x)
+  _, y = while_loop(cond_fn, body_fn, (0, x))
+  return y
+
+def g(x):
+  return cos(cos(cos(x)))
+
+print(jvp(f, (1.,), (1.,)))
+print(jvp(g, (1.,), (1.,)))
